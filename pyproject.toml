@@ -1,0 +1,31 @@
+[project]
+name = "facial-expression-classification"
+version = "2.0.0"
+description = "Klasifikasi 7 ekspresi wajah YOLOv8m — FER2013 + Streamlit (Bahasa Indonesia)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name="Herfandi"}]
+dependencies = [
+  "ultralytics>=8.0",
+  "streamlit>=1.30",
+  "opencv-python-headless>=4.8",
+  "mediapipe==0.10.14",
+  "pillow>=10.0",
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scikit-learn>=1.3",
+  "seaborn>=0.12",
+  "matplotlib>=3.7",
+  "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.16", "onnx"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["streamlit-app"]
