@@ -49,8 +49,9 @@ klasifikasi-ekspresi-wajah/
 │   └── classify/               # arsip uji validasi (val, val-2…val-9, dll.)
 ├── docs/
 │   ├── Dokumentasi Klasifikasi Ekspresi Wajah.docx  # 📄 dokumentasi resmi: use case, dataset, langkah pakai (screenshot asli), source code
+│   ├── Naskah Video Demo Klasifikasi Ekspresi Wajah.docx  # 🎬 alur video per menit + narasi siap baca + gambar acuan
 │   ├── proposal.md             # draf proposal format PIDI Digdaya 2026
-│   ├── video_script.md         # naskah video demo + suara
+│   ├── video_script.md         # ringkasan alur video demo (versi teks)
 │   ├── README_ID.md            # README versi awal (Bahasa Indonesia)
 │   ├── Jonathan Corn Disease Classifier.docx  # referensi struktur dokumentasi teman
 │   ├── confusion_matrix.png / confusion_matrix_v3.png
