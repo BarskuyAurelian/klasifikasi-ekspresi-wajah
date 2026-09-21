@@ -1,7 +1,9 @@
 ultralytics>=8.0
 streamlit>=1.30
 opencv-python-headless>=4.8
-mediapipe==0.10.14
+# mediapipe bersifat OPSIONAL — deteksi wajah utama memakai OpenCV YuNet DNN
+# (model face_detection_yunet_2023mar.onnx dibundel di folder aplikasi)
+# mediapipe==0.10.14
 pillow>=10.0
 numpy>=1.24
 pandas>=2.0

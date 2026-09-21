@@ -1,363 +1,770 @@
 """
-Streamlit - Uji Validasi 7 Ekspresi YOLOv8m (224px)
-V2 - Label Indonesia: jijik, marah, netral, sedih, senang, takut, terkejut
-Fitur: Unggah Gambar, Kamera Langsung, Uji 7 Ekspresi, Unggah Video
-Bahasa: Indonesia penuh
+Streamlit — Klasifikasi Ekspresi Wajah (YOLOv8m-cls · FER2013 · 7 kelas)
+───────────────────────────────────────────────────────────────────────
+UI modern & profesional untuk menguji model:
+  📤 Analisis Gambar · 🎥 Kamera · 🧪 Uji 7 Ekspresi · 🎞️ Video · 📊 Info Model
+
+Model final: V3 + Fine-Tune (freeze=4) — Top-1 69,59% · Top-5 98,98% (seed 42, deterministik).
+Bahasa: Indonesia
 """
-import streamlit as st
-import cv2
-import numpy as np
 import os
+import glob
+import random
+import time
 import tempfile
 from collections import Counter
-from PIL import Image
-import pandas as pd
+from pathlib import Path
 
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
 from ultralytics import YOLO
-try:
+
+try:  # detektor wajah opsional
     import mediapipe as mp
 except ImportError:
     mp = None
 
-# ========= PENGATURAN HALAMAN =========
-st.set_page_config(page_title="Uji Ekspresi YOLOv8m", page_icon="😊", layout="wide")
+# ═══════════════════════════════════════════════════════════════════
+#  KONFIGURASI
+# ═══════════════════════════════════════════════════════════════════
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Cari model V2
-DAFTAR_MODEL = [
-    r"C:\Users\Admin\Documents\Kuliah\herfandi-ml\hasil_ekspresi_yolov8m\yolov8m-ekpresi\weights\best.pt",
-    r"C:\Users\Admin\Documents\Kuliah\herfandi-ml\facial-expression-classification\models\best.pt",
-    "yolov8m-ekpresi/weights/best.pt",
-    "weights/best.pt",
-    "best.pt",
-]
-MODEL_PATH = next((p for p in DAFTAR_MODEL if os.path.exists(p)), DAFTAR_MODEL[0])
+st.set_page_config(
+    page_title="Klasifikasi Ekspresi Wajah — YOLOv8m",
+    page_icon="😊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-INFO_KELAS = {
-    'marah':    {'emoji':'😠','warna':'#dc3545','deskripsi':'Marah — alis mengerut, rahang mengencang'},
-    'jijik':    {'emoji':'🤢','warna':'#6f42c1','deskripsi':'Jijik — hidung mengerut, bibir atas terangkat'},
-    'takut':    {'emoji':'😨','warna':'#fd7e14','deskripsi':'Takut — mata melebar, mulut terbuka'},
-    'senang':   {'emoji':'😄','warna':'#28a745','deskripsi':'Senang — senyum, pipi terangkat'},
-    'netral':   {'emoji':'😐','warna':'#6c757d','deskripsi':'Netral — wajah datar'},
-    'sedih':    {'emoji':'😢','warna':'#007bff','deskripsi':'Sedih — sudut bibir turun'},
-    'terkejut': {'emoji':'😯','warna':'#ffc107','deskripsi':'Terkejut — mata & mulut terbuka lebar'},
+# ── Pustaka model: models/best.pt (final) + semua checkpoint hasil training ──
+def _cari_model():
+    kandidat = []
+    utama = REPO_ROOT / "models" / "best.pt"
+    if utama.exists():
+        kandidat.append(utama)
+    kandidat += sorted(REPO_ROOT.glob("runs/*/weights/best.pt"))
+    kandidat += sorted(REPO_ROOT.glob("runs/classify/*/weights/best.pt"))
+    # jalur lama (backup jika repo dipindah)
+    if not kandidat:
+        for p in [
+            r"C:\Users\Admin\Documents\Kuliah\herfandi-ml\hasil_ekspresi_yolov8m\yolov8m-ekpresi\weights\best.pt",
+            r"C:\Users\Admin\Documents\Kuliah\herfandi-ml\facial-expression-classification\models\best.pt",
+        ]:
+            if os.path.exists(p):
+                kandidat.append(Path(p))
+    return list(dict.fromkeys(kandidat))  # unik, urut tetap
+
+DAFTAR_MODEL = _cari_model()
+
+# Metrik top-1/top-5 yang TERVERIFIKASI dari validasi final (bukan perkiraan)
+METRIK_BY_FILE = {
+    "best.pt":                            (69.59, 98.98),  # models/best.pt = fine-tune final (sha identik)
+    "yolov8m-v3-ft":                      (69.59, 98.98),
+    "yolov8m-v3":                         (62.93, 98.57),
 }
 
-if 'basis_data_lacak' not in st.session_state:
-    st.session_state.basis_data_lacak = {}
+INFO_KELAS = {
+    "marah":    {"emoji": "😠", "warna": "#ef4444", "recall": 61.6, "support": 958,
+                 "deskripsi": "Alis mengerut, rahang mengencang, bibir menekan"},
+    "jijik":    {"emoji": "🤢", "warna": "#a855f7", "recall": 68.5, "support": 111,
+                 "deskripsi": "Hidung mengerut, bibir atas terangkat, sering mirip marah"},
+    "takut":    {"emoji": "😨", "warna": "#f59e0b", "recall": 51.3, "support": 1024,
+                 "deskripsi": "Mata melebar, mulut terbuka, sering tertukar sedih"},
+    "senang":   {"emoji": "😄", "warna": "#22c55e", "recall": 86.5, "support": 1774,
+                 "deskripsi": "Senyum lebar, pipi terangkat — kelas paling andal"},
+    "netral":   {"emoji": "😐", "warna": "#64748b", "recall": 69.1, "support": 1233,
+                 "deskripsi": "Wajah datar, otot rileks"},
+    "sedih":    {"emoji": "😢", "warna": "#3b82f6", "recall": 58.7, "support": 1247,
+                 "deskripsi": "Sudut bibir turun, alis naik ke tengah"},
+    "terkejut": {"emoji": "😯", "warna": "#eab308", "recall": 82.6, "support": 831,
+                 "deskripsi": "Mata & mulut terbuka lebar, alis terangkat"},
+}
 
-# ========= MUAT MODEL =========
-@st.cache_resource
+# ═══════════════════════════════════════════════════════════════════
+#  CSS — tema modern (gelap, kartu membulat, gradasi halus)
+# ═══════════════════════════════════════════════════════════════════
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap');
+    .stApp { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; }
+    [data-testid="stMetricValue"] { font-size: 1.9rem; font-weight: 800; }
+    [data-testid="stMetricLabel"] { color: #94a3b8; }
+    [data-testid="stMetric"] {
+        background: linear-gradient(150deg, #1e293b, #0f172a);
+        border: 1px solid #334155; border-radius: 16px;
+        padding: 14px 18px;
+    }
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 12px; padding: 8px 18px; font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] { background: #312e81; }
+    .stButton>button, .stDownloadButton>button {
+        border-radius: 12px; font-weight: 600;
+    }
+    div[data-testid="stFileUploader"] { border-radius: 14px; }
+    .chip {
+        display:inline-block; background:#1e293b; color:#e2e8f0;
+        border:1px solid #334155; border-radius:999px;
+        padding:4px 12px; margin:2px; font-size:12px;
+    }
+    footer { visibility: hidden; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ═══════════════════════════════════════════════════════════════════
+#  KOMPONEN UI
+# ═══════════════════════════════════════════════════════════════════
+def component_hero(judul, subjudul, badge):
+    st.markdown(
+        f"""
+        <div style="background:linear-gradient(120deg,#0f172a,#1e293b 50%,#312e81);
+                    border:1px solid #334155aa;border-radius:22px;
+                    padding:26px 32px;color:#f8fafc;margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+            <div>
+              <div style="font-size:30px;font-weight:800;letter-spacing:-0.5px">{judul}</div>
+              <div style="color:#94a3b8;margin-top:6px;font-size:14px">{subjudul}</div>
+            </div>
+            <div style="background:#33415566;border:1px solid #475569;border-radius:999px;
+                        padding:10px 18px;font-size:13px;color:#c7d2fe">{badge}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def component_kartu_prediksi(label, keyakinan, probs, nama_kelas, lebar="100%"):
+    """Kartu hasil prediksi modern: emoji + label + bar keyakinan + top-3 probabilitas."""
+    info = INFO_KELAS.get(label, {"emoji": "🎭", "warna": "#64748b", "deskripsi": ""})
+    emoji, warna = info["emoji"], info["warna"]
+    teratas = sorted(zip(nama_kelas, probs), key=lambda x: -x[1])[:3]
+    baris = ""
+    for nm, p in teratas:
+        baris += (
+            f'<div style="margin-top:8px">'
+            f'<div style="display:flex;justify-content:space-between;font-size:12px;color:#94a3b8">'
+            f'<span>{nm}</span><span>{p*100:.1f}%</span></div>'
+            f'<div style="background:#0f172a;border-radius:8px;height:7px;margin-top:3px;overflow:hidden">'
+            f'<div style="background:{warna};width:{max(2,int(p*100))}%;height:7px;border-radius:8px"></div></div></div>'
+        )
+    return (
+        f'<div style="background:linear-gradient(160deg,{warna}1f,#0f172a);'
+        f'border:1px solid {warna}55;border-radius:18px;padding:18px 20px;'
+        f'color:#f1f5f9;max-width:{lebar}">'
+        f'<div style="display:flex;align-items:center;gap:14px">'
+        f'<div style="font-size:38px">{emoji}</div>'
+        f'<div>'
+        f'<div style="font-size:22px;font-weight:800">{label}</div>'
+        f'<div style="color:#94a3b8;font-size:13px">'
+        f'Keyakinan {keyakinan*100:.1f}% · {info.get("deskripsi", "")}'
+        f'</div>'
+        f'</div>'
+        f'</div>'
+        f'<div style="margin-top:12px;background:#0f172a;border-radius:10px;height:10px;overflow:hidden">'
+        f'<div style="background:{warna};width:{max(2,int(keyakinan*100))}%;height:10px;border-radius:10px"></div>'
+        f'</div>{baris}'
+        f'</div>'
+    )
+
+
+def component_metric(label, nilai, delta=None, bantuan=None, help=None):
+    st.metric(label=label, value=nilai, delta=delta, help=help or bantuan)
+
+
+def komponen_chip(teks):
+    return f'<span class="chip">{teks}</span>'
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  MUAT MODEL & DETEKTOR WAJAH (di-cache)
+# ═══════════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner="Memuat model…")
 def muat_model(path):
-    if not os.path.exists(path):
-        st.error(f"Model tidak ditemukan: {path}")
-        st.stop()
-    m = YOLO(path)
-    return m
+    return YOLO(path)
 
-model = muat_model(MODEL_PATH)
-# Ambil daftar kelas langsung dari model (urutan: jijik, marah, netral, sedih, senang, takut, terkejut)
-DAFTAR_KELAS = list(model.names.values())
-PEMETAAN_NAMA_KE_ID = {v:k for k,v in model.names.items()}
 
-# Detektor wajah
-deteksi_wajah = None
-haar_cascade = None
-if mp is not None and hasattr(mp, "solutions"):
-    try:
-        if hasattr(mp.solutions, "face_detection"):
-            mp_wajah = mp.solutions.face_detection
-            deteksi_wajah = mp_wajah.FaceDetection(min_detection_confidence=0.5)
-    except Exception:
-        deteksi_wajah = None
-if deteksi_wajah is None:
+@st.cache_resource
+def muat_detektor():
+    """Detektor wajah berlapis: YuNet DNN → MediaPipe → Haar Cascade (file model dibundel).
+
+    YuNet (OpenCV FaceDetectorYN) jadi prioritas karena paling andal & cepat untuk
+    kamera real-time; MediaPipe dipakai bila tersedia; Haar sebagai cadangan.
+    Mengembalikan dict {"utama": (jenis, objek) | None, "haar": objek | None, "label": str}.
+    """
+    folder_app = Path(__file__).parent
+    utama, haar, label = None, None, "tidak tersedia"
+
+    # 1) YuNet DNN (OpenCV FaceDetectorYN) — paling andal untuk webcam/live
+    onnx = folder_app / "face_detection_yunet_2023mar.onnx"
+    if getattr(cv2, "FaceDetectorYN", None) is not None and onnx.exists():
+        try:
+            obj = cv2.FaceDetectorYN.create(
+                str(onnx), "", (320, 320),
+                score_threshold=0.6, nms_threshold=0.3, top_k=5000,
+                backend_id=cv2.dnn.DNN_BACKEND_OPENCV, target_id=cv2.dnn.DNN_TARGET_CPU,
+            )
+            utama, label = ("yunet", obj), "YuNet DNN"
+        except Exception:
+            utama, label = None, "tidak tersedia"
+
+    # 2) MediaPipe Tasks API (kalau binding C berfungsi pada Python ini)
+    if utama is None and mp is not None:
+        try:
+            from mediapipe.tasks import python as mp_python  # type: ignore
+            from mediapipe.tasks.python import vision as mp_vision  # type: ignore
+            tflite = folder_app / "blaze_face_short_range.tflite"
+            if tflite.exists():
+                obj = mp_vision.FaceDetector.create_from_options(
+                    mp_vision.FaceDetectorOptions(
+                        base_options=mp_python.BaseOptions(model_asset_path=str(tflite)),
+                        running_mode=mp_vision.RunningMode.IMAGE,
+                        min_detection_confidence=0.5,
+                    )
+                )
+                utama, label = ("tasks", obj), "MediaPipe FaceDetector"
+        except Exception:
+            utama = None
+
+    # 3) MediaPipe legacy (mp.solutions) — hanya bila API lama masih ada
+    if utama is None and mp is not None and hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
+        try:
+            obj = mp.solutions.face_detection.FaceDetection(min_detection_confidence=0.5)
+            utama, label = ("legacy", obj), "MediaPipe FaceDetection"
+        except Exception:
+            utama = None
+
+    # 4) Haar Cascade yang dibundel — selalu dimuat sebagai cadangan terakhir
     kandidat = [
-        os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml") if hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades") else "",
-        os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml"),
-        "haarcascade_frontalface_default.xml",
+        str(folder_app / "haarcascade_frontalface_default.xml"),
+        os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        if hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades") else "",
     ]
     path_haar = next((p for p in kandidat if p and os.path.exists(p)), None)
     if path_haar:
-        haar_cascade = cv2.CascadeClassifier(path_haar)
+        c = cv2.CascadeClassifier(path_haar)
+        if not c.empty():
+            haar = c
+            if utama is None:
+                label = "Haar Cascade"
+    return {"utama": utama, "haar": haar, "label": label}
+
 
 def prediksi_potongan(bgr):
     if bgr is None or bgr.size == 0:
-        return None, None, None
+        return None
     hasil = model(bgr, verbose=False)
     prob = hasil[0].probs
-    idx = int(prob.top1)
-    keyakinan = float(prob.top1conf)
-    label = model.names[idx]
-    semua_prob = prob.data.cpu().numpy() if hasattr(prob.data, 'cpu') else np.array(prob.data)
-    return label, keyakinan, semua_prob
+    semua = prob.data.cpu().numpy() if hasattr(prob.data, "cpu") else np.array(prob.data)
+    return {"label": model.names[int(prob.top1)],
+            "keyakinan": float(prob.top1conf),
+            "prob": semua}
+
 
 def deteksi_wajah_list(bgr):
-    t,l,_ = bgr.shape
-    wajah=[]
-    if deteksi_wajah is not None:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        hasil = deteksi_wajah.process(rgb)
-        if hasil and hasil.detections:
-            for det in hasil.detections:
-                kotak = det.location_data.relative_bounding_box
-                x1=int(kotak.xmin*l); y1=int(kotak.ymin*t)
-                x2=x1+int(kotak.width*l); y2=y1+int(kotak.height*t)
-                wajah.append((max(0,x1),max(0,y1),min(l,x2),min(t,y2)))
-    elif haar_cascade is not None:
-        abu=cv2.cvtColor(bgr,cv2.COLOR_BGR2GRAY)
-        daftar=haar_cascade.detectMultiScale(abu, scaleFactor=1.1, minNeighbors=5, minSize=(60,60))
-        for (x,y,w,h) in daftar:
-            wajah.append((x,y,x+w,y+h))
-    if not wajah and max(t,l) <= 300:
-        wajah=[(0,0,l,t)]
+    t, l, _ = bgr.shape
+    wajah = []
+    utama = detektor.get("utama")
+    if utama is not None:
+        jenis, obj = utama
+        if jenis == "yunet":  # OpenCV YuNet → kotak piksel langsung
+            try:
+                obj.setInputSize((l, t))
+                _, faces = obj.detect(bgr)
+                if faces is not None:
+                    for f in faces:
+                        x, y, w, h = [int(v) for v in f[:4]]
+                        if float(f[-1]) >= 0.6 and w > 0 and h > 0:
+                            wajah.append((max(0, x), max(0, y), min(l, x + w), min(t, y + h)))
+            except Exception:
+                pass
+        elif jenis == "tasks":  # MediaPipe Tasks API (kotak piksel)
+            try:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                has = obj.detect(img)
+                if has and has.detections:
+                    for dt in has.detections:
+                        bb = dt.bounding_box
+                        x1, y1 = bb.origin_x, bb.origin_y
+                        x2, y2 = x1 + bb.width, y1 + bb.height
+                        wajah.append((max(0, x1), max(0, y1), min(l, x2), min(t, y2)))
+            except Exception:
+                pass
+        elif jenis == "legacy":  # MediaPipe mp.solutions (box relatif)
+            try:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                has = obj.process(rgb)
+                if has and has.detections:
+                    for dt in has.detections:
+                        kotak = dt.location_data.relative_bounding_box
+                        x1 = int(kotak.xmin * l); y1 = int(kotak.ymin * t)
+                        x2 = x1 + int(kotak.width * l); y2 = y1 + int(kotak.height * t)
+                        wajah.append((max(0, x1), max(0, y1), min(l, x2), min(t, y2)))
+            except Exception:
+                pass
+    # cadangan: Haar Cascade (dengan equalizeHist agar tahan cahaya webcam)
+    if not wajah and detektor.get("haar") is not None:
+        abu = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        abu = cv2.equalizeHist(abu)
+        daftar = detektor["haar"].detectMultiScale(abu, scaleFactor=1.1, minNeighbors=4, minSize=(50, 50))
+        wajah = [(x, y, x + w, y + h) for (x, y, w, h) in daftar]
+    # cadangan terakhir: foto dekat berukuran kecil (≤300 px) → pakai full-frame
+    if not wajah and max(t, l) <= 300:
+        wajah.append((0, 0, l, t))
     return wajah
 
+
 def anotasi_frame(bgr):
-    daftar_wajah=deteksi_wajah_list(bgr)
-    anotasi=bgr.copy()
-    deteksi=[]
-    for i,(x1,y1,x2,y2) in enumerate(daftar_wajah):
-        potongan=bgr[y1:y2, x1:x2]
-        if potongan.size==0: continue
-        label,keyakinan,prob=prediksi_potongan(potongan)
-        if label is None: continue
-        id_lacak=f"Wajah_{i+1}"
-        if id_lacak not in st.session_state.basis_data_lacak:
-            st.session_state.basis_data_lacak[id_lacak]=[]
-        st.session_state.basis_data_lacak[id_lacak].append(label)
-        warna=(0,255,0)
-        cv2.rectangle(anotasi,(x1,y1),(x2,y2),warna,2)
-        cv2.putText(anotasi,f"{label} {keyakinan:.0%}",(x1,y1-10),cv2.FONT_HERSHEY_SIMPLEX,0.7,warna,2)
-        deteksi.append({"kotak":(x1,y1,x2,y2),"label":label,"keyakinan":keyakinan,"prob":prob})
+    """Deteksi wajah + prediksi tiap wajah → gambar anotasi + daftar hasil."""
+    anotasi = bgr.copy()
+    deteksi = []
+    for i, (x1, y1, x2, y2) in enumerate(deteksi_wajah_list(bgr)):
+        potongan = bgr[y1:y2, x1:x2]
+        if potongan.size == 0:
+            continue
+        r = prediksi_potongan(potongan)
+        if r is None:
+            continue
+        warna = INFO_KELAS.get(r["label"], {}).get("warna", "#22c55e")
+        warna_bgr = tuple(int(warna[i:i+2], 16) for i in (5, 3, 1))
+        cv2.rectangle(anotasi, (x1, y1), (x2, y2), warna_bgr, 2)
+        label = f"{r['label']} {r['keyakinan']:.0%}"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(anotasi, (x1, max(0, y1 - th - 12)), (x1 + tw + 12, y1), warna_bgr, -1)
+        cv2.putText(anotasi, label, (x1 + 6, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (10, 10, 15), 2, cv2.LINE_AA)
+        deteksi.append({"kotak": (x1, y1, x2, y2), **r})
     return anotasi, deteksi
 
-# ========= JUDUL =========
-st.title("😊 Uji Validasi Ekspresi — YOLOv8m V2 (71,2% FER2013)")
-st.caption(f"Model: `{os.path.basename(MODEL_PATH)}` | Kelas: {', '.join(DAFTAR_KELAS)} | ukuran: 224 | {model.names}")
+
+# ═══════════════════════════════════════════════════════════════════
+#  PILIH MODEL + SIDEBAR
+# ═══════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("### ⚙️ Pengaturan Model")
+
+    if DAFTAR_MODEL:
+        label_pilihan = {
+            str(p): (
+                f"⭐ Model Final — {p.parent.parent.name if p.parent.parent.name != 'models' else 'best.pt'}"
+                if p == REPO_ROOT / "models" / "best.pt"
+                else f"{p.parent.parent.name} — {METRIK_BY_FILE.get(p.parent.parent.name, ('—', '—'))[0]:.2f}%"
+            )
+            for p in DAFTAR_MODEL
+        }
+        pilihan = st.selectbox(
+            "Pilih checkpoint model",
+            [str(p) for p in DAFTAR_MODEL],
+            format_func=lambda p: label_pilihan[p],
+        )
+        MODEL_PATH = pilihan
+    else:
+        MODEL_PATH = "models/best.pt"
+        st.warning("Model tidak ditemukan. Jalankan notebook export dulu.")
+
+    ambang = st.slider("Batas keyakinan rendah (info)", 0.0, 1.0, 0.5, 0.05)
+
+    st.divider()
+    st.markdown("#### 😶 Daftar Kelas & Recall Uji")
+    for k in sorted(INFO_KELAS):
+        info = INFO_KELAS[k]
+        st.markdown(
+            f"{info['emoji']} **{k}** — {info['recall']:.1f}% "
+            f"<span style='color:#64748b;font-size:12px'>(uji {info['support']})</span>",
+            unsafe_allow_html=True,
+        )
+    st.divider()
+    if st.button("🧹 Kosongkan Riwayat Kamera", width="stretch"):
+        st.session_state.rekap_kamera = []
+        st.rerun()
+
+# ===== muat model & detektor sekali untuk seluruh sesi =====
+model = muat_model(MODEL_PATH)
+DAFTAR_KELAS = list(model.names.values())
+detektor = muat_detektor()
+
+nama_model = Path(MODEL_PATH).parent.parent.name
+metrik = METRIK_BY_FILE.get(nama_model) or METRIK_BY_FILE.get(Path(MODEL_PATH).name) or (None, None)
+
+if "rekap_kamera" not in st.session_state:
+    st.session_state.rekap_kamera = []
+if "kamera_aktif" not in st.session_state:
+    st.session_state.kamera_aktif = False
+
+# ═══════════════════════════════════════════════════════════════════
+#  HALAMAN UTAMA
+# ═══════════════════════════════════════════════════════════════════
+component_hero(
+    "😊 Klasifikasi Ekspresi Wajah",
+    "YOLOv8m-cls · FER2013 · 7 ekspresi · seed 42 (deterministik) — validasi otomatis 7.178 gambar uji asli.",
+    f"Model: <b>{Path(MODEL_PATH).parent.parent.name}</b>",
+)
+
+m1, m2, m3, m4 = st.columns(4)
+component_metric("Top-1 Akurasi (uji)", f"{metrik[0]:.2f}%" if metrik[0] else "—",
+                 help="Akurasi label tunggal pada 7.178 gambar uji asli FER2013")
+component_metric("Top-5 Akurasi (uji)", f"{metrik[1]:.2f}%" if metrik[1] else "—",
+                 help="Label benar masuk 5 prediksi teratas")
+component_metric("Jumlah Kelas", f"{len(DAFTAR_KELAS)}", help="marah · jijik · takut · senang · netral · sedih · terkejut")
+component_metric("Detektor Wajah", detektor["label"], help="Prioritas: YuNet DNN → MediaPipe → Haar Cascade (file model dibundel di folder aplikasi)")
+
 st.markdown("---")
 
-with st.sidebar:
-    st.header("⚙️ Pengaturan")
-    ambang = st.slider("Ambang keyakinan (hanya info)", 0.0, 1.0, 0.5)
-    st.write(f"Lokasi model: `{MODEL_PATH}`")
-    st.write(f"Perangkat: otomatis")
-    st.divider()
-    st.header("📋 Cara Uji 7 Ekspresi")
-    st.info("1. Pilih mode **🧪 Uji 7 Ekspresi**\n2. Unggah 1 foto tiap ekspresi (pose depan, cahaya terang)\n3. Lihat ✅/❌ apakah prediksi = ekspresi yang diharapkan\n4. Atau pakai **Unggah Gambar** untuk tes bebas\n5. **Kamera Langsung** untuk tes langsung")
-    if st.button("🔄 Atur Ulang Log"):
-        st.session_state.basis_data_lacak={}
-        st.rerun()
-    st.divider()
-    st.header("😶 Daftar Kelas")
-    for k in DAFTAR_KELAS:
-        info=INFO_KELAS.get(k, {"emoji":"•","deskripsi":k})
-        st.write(f"{info['emoji']} **{k}** — {info.get('deskripsi','')}")
+tab_gambar, tab_kamera, tab_tujuh, tab_video, tab_info = st.tabs(
+    ["📤 Analisis Gambar", "🎥 Kamera Langsung", "🧪 Uji 7 Ekspresi", "🎞️ Analisis Video", "📊 Info Model"]
+)
 
-mode = st.radio("Pilih mode:", ["📷 Unggah Gambar (bebas)","🎥 Kamera Langsung","🧪 Uji 7 Ekspresi (validasi)","🎞️ Unggah Video"], horizontal=True)
-
-# ===== MODE 1: Unggah bebas =====
-if mode == "📷 Unggah Gambar (bebas)":
-    k1,k2=st.columns(2)
+# ════════════ TAB 1 — GAMBAR ════════════
+with tab_gambar:
+    st.markdown("#### 📤 Unggah Foto & Analisis")
+    k1, k2 = st.columns([2, 3], gap="large")
     with k1:
-        st.header("📤 Unggah")
-        unggah=st.file_uploader("Pilih gambar JPG/PNG (bisa banyak wajah)", type=['jpg','jpeg','png'])
+        unggah = st.file_uploader(
+            "Pilih gambar (JPG/PNG) — bisa berisi banyak wajah",
+            type=["jpg", "jpeg", "png"],
+        )
         if unggah:
-            gambar=Image.open(unggah).convert("RGB")
-            st.image(gambar, caption="Gambar masukan", use_container_width=True)
+            gambar = Image.open(unggah).convert("RGB")
+            st.image(gambar, caption="Masukan", width="stretch")
     with k2:
-        st.header("🔍 Hasil")
         if unggah:
-            bgr=cv2.cvtColor(np.array(gambar), cv2.COLOR_RGB2BGR)
-            with st.spinner("Sedang menganalisis..."):
-                an,det=anotasi_frame(bgr)
+            bgr = cv2.cvtColor(np.array(gambar), cv2.COLOR_RGB2BGR)
+            with st.spinner("Menganalisis ekspresi…"):
+                an, det = anotasi_frame(bgr)
             if not det:
-                st.warning("Tidak ada wajah terdeteksi. Coba foto lebih dekat/terang. Jika potongan kecil 48px, fallback full-frame aktif.")
+                st.warning(
+                    "😕 Tidak ada wajah terdeteksi. Coba foto lebih dekat, pose depan, "
+                    "dan pencahayaan terang. (Potongan kecil ≤300px otomatis dianalisis full-frame.)"
+                )
             else:
-                st.image(cv2.cvtColor(an,cv2.COLOR_BGR2RGB), caption="Hasil", use_container_width=True)
-                for d in det:
-                    info=INFO_KELAS.get(d['label'], {"emoji":""})
-                    st.markdown(f"### {info['emoji']} **{d['label']}** — {d['keyakinan']:.2%} {'✅' if d['keyakinan']>=ambang else '⚠️ keyakinan rendah'}")
-                    st.progress(int(d['keyakinan']*100))
-                    kamus_prob={model.names[i]: float(v) for i,v in enumerate(d['prob'])}
-                    kamus_prob=dict(sorted(kamus_prob.items(), key=lambda x: x[1], reverse=True))
-                    st.bar_chart(kamus_prob)
-                    if d['label'] in ['takut','sedih','marah','netral']:
-                        st.caption("⚠️ Kelas ini sering tertukar (lihat matriks kebingungan: takut↔sedih, sedih↔netral).")
+                k_an, k_res = st.columns([3, 2], gap="medium")
+                with k_an:
+                    st.image(cv2.cvtColor(an, cv2.COLOR_BGR2RGB), caption="Hasil anotasi", width="stretch")
+                with k_res:
+                    for d in det:
+                        st.markdown(
+                            component_kartu_prediksi(d["label"], d["keyakinan"], d["prob"], DAFTAR_KELAS),
+                            unsafe_allow_html=True,
+                        )
+                    if len(det) > 1:
+                        st.caption(f"👥 {len(det)} wajah terdeteksi.")
 
-# ===== MODE 2: Kamera =====
-elif mode == "🎥 Kamera Langsung":
-    st.header("🎥 Kamera Langsung")
-    jalan=st.checkbox("Aktifkan Kamera", value=False)
-    kol1,kol2=st.columns([2,1])
-    jendela=kol1.image([])
-    area_stat=kol2.empty()
-    if jalan:
-        cap=cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Kamera tidak tersedia.")
+# ════════════ TAB 2 — KAMERA REAL-TIME (bounding box live) ════════════
+with tab_kamera:
+    st.markdown("#### 🎥 Kamera Real-Time — bounding box langsung di video")
+    st.caption(
+        "Klik **🟢 Mulai Kamera** → kotak pembatas (bounding box) + label ekspresi + persentase "
+        "langsung tampil di video secara live. Gunakan pose depan, cahaya terang, jarak ±50 cm. "
+        "*(Memakai webcam laptop lewat OpenCV — tidak bergantung izin kamera di browser.)*"
+    )
+
+    c_mulai, c_berhenti = st.columns(2)
+    with c_mulai:
+        if st.button("🟢 Mulai Kamera", type="primary", width="stretch"):
+            st.session_state.kamera_aktif = True
+    with c_berhenti:
+        if st.button("⏹ Berhenti", width="stretch"):
+            st.session_state.kamera_aktif = False
+
+    if st.session_state.kamera_aktif:
+        # buka webcam (coba index 0 dulu, lalu 1)
+        cap = None
+        for idx in (0, 1):
+            c = cv2.VideoCapture(idx)
+            if c.isOpened():
+                cap = c
+                break
+            c.release()
+        if cap is None:
+            st.session_state.kamera_aktif = False
+            st.error(
+                "❌ Kamera tidak dapat diakses. Tutup aplikasi lain yang memakai webcam "
+                "(browser/meeting), lalu klik Mulai lagi."
+            )
         else:
-            while jalan:
-                ret,frame=cap.read()
-                if not ret: break
-                an,_=anotasi_frame(frame)
-                jendela.image(cv2.cvtColor(an,cv2.COLOR_BGR2RGB))
-                with area_stat.container():
-                    st.markdown("### 📈 Rekap")
-                    if not st.session_state.basis_data_lacak:
-                        st.write("Belum ada data.")
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            st.success("🟢 Kamera menyala — bounding box & ekspresi tampil live di video.")
+            k_video, k_info = st.columns([3, 2], gap="large")
+            with k_video:
+                holder_video = st.empty()      # video + bounding box live (ukuran terkontrol)
+            with k_info:
+                holder_status = st.empty()     # status FPS / jumlah wajah
+                holder_info = st.empty()       # kartu ekspresi live
+            rekap = st.session_state.rekap_kamera
+            t0, hitung, fps = time.time(), 0, 0.0
+            try:
+                while st.session_state.kamera_aktif:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    an, det = anotasi_frame(frame)
+                    hitung += 1
+                    now = time.time()
+                    if now - t0 >= 1.0:
+                        fps = hitung / (now - t0)
+                        hitung, t0 = 0, now
+                    holder_video.image(cv2.cvtColor(an, cv2.COLOR_BGR2RGB), width=560)
+                    if det:
+                        d0 = det[0]
+                        emo = INFO_KELAS.get(d0["label"], {}).get("emoji", "🙂")
+                        rekap.append({"label": d0["label"], "keyakinan": d0["keyakinan"]})
+                        if len(rekap) > 1000:
+                            del rekap[: len(rekap) - 1000]
+                        teks = (
+                            f"🟢 LIVE · FPS ±{fps:.0f} · Wajah: {len(det)} · "
+                            f"Ekspresi: **{d0['label']}** ({d0['keyakinan'] * 100:.0f}%)"
+                        )
+                        holder_info.markdown(
+                            f"<div style='background:#0f172a;border:1px solid #eab308;border-radius:14px;"
+                            f"padding:14px 16px;'><div style='color:#94a3b8;font-size:.85rem'>"
+                            f"EKSPRESI TERDETEKSI</div><div style='font-size:1.5rem;font-weight:700;"
+                            f"color:#fbbf24'>{emo} {d0['label']}</div>"
+                            f"<div style='color:#94a3b8;font-size:.9rem;margin-top:2px'>"
+                            f"Keyakinan <b>{d0['keyakinan'] * 100:.0f}%</b></div></div>",
+                            unsafe_allow_html=True,
+                        )
                     else:
-                        for id_lacak,riwayat in st.session_state.basis_data_lacak.items():
-                            hit=Counter(riwayat); tot=len(riwayat)
-                            st.write(f"**{id_lacak}** ({tot} frame)")
-                            df=pd.DataFrame([{"Ekspresi":f"{INFO_KELAS.get(k,{}).get('emoji','')} {k}","Jumlah":hit.get(k,0),"Persentase":f"{hit.get(k,0)/tot*100:.1f}%"} for k in DAFTAR_KELAS])
-                            st.table(df)
-                            st.bar_chart({k:hit.get(k,0) for k in DAFTAR_KELAS})
-            cap.release()
+                        teks = (
+                            f"🟡 LIVE · FPS ±{fps:.0f} · Wajah belum terdeteksi — "
+                            f"dekatkan wajah / perbaiki cahaya"
+                        )
+                        holder_info.markdown(
+                            f"<div style='background:#0f172a;border:1px solid #334155;border-radius:14px;"
+                            f"padding:14px 16px;color:#64748b;font-size:.9rem'>Menunggu wajah… "
+                            f"<br>Posisikan wajah di depan kamera.</div>",
+                            unsafe_allow_html=True,
+                        )
+                    holder_status.caption(teks)
+            finally:
+                cap.release()
+            st.session_state.kamera_aktif = False
+            st.info("⏹ Kamera dihentikan.")
     else:
-        st.info("Centang Aktifkan Kamera. Pastikan browser memberi izin kamera.")
+        st.info("Kamera dalam keadaan mati. Klik **🟢 Mulai Kamera** untuk streaming deteksi real-time.")
 
-# ===== MODE 3: Uji 7 Ekspresi =====
-elif mode == "🧪 Uji 7 Ekspresi (validasi)":
-    st.header("🧪 Uji 7 Ekspresi — Apakah semua sesuai?")
-    st.write("Unggah **1 foto per ekspresi** yang kamu peragakan. Sistem akan cek apakah prediksi = label yang diharapkan. Ini cara paling jujur untuk cek overfit/takut↔sedih.")
-    st.caption("Tips: pose ekspresif, cahaya depan, jarak 50cm, 1 orang per foto, hindari masker/kacamata gelap.")
+    st.divider()
+    st.markdown("##### 📈 Rekap Sesi (terkumpul otomatis saat kamera menyala)")
+    rekap = st.session_state.rekap_kamera
+    if not rekap:
+        st.info("Belum ada data. Mulai kamera dan biarkan beberapa detik.")
+    else:
+        hit = Counter(r["label"] for r in rekap)
+        tot = len(rekap)
+        df_rc = pd.DataFrame(
+            [{"Ekspresi": f"{INFO_KELAS.get(k, {}).get('emoji', '')} {k}",
+              "Jumlah": hit.get(k, 0),
+              "Persentase": f"{hit.get(k, 0) / tot * 100:.1f}%"} for k in DAFTAR_KELAS]
+        )
+        st.table(df_rc[df_rc["Jumlah"] > 0] if (df_rc["Jumlah"] > 0).any() else df_rc)
+        c3 = st.columns(3)
+        c3[0].metric("Jumlah Frame", tot)
+        c3[1].metric("Ekspresi Dominan", hit.most_common(1)[0][0] if hit else "—")
+        c3[2].metric(
+            "Keyakinan Rata-rata",
+            f"{np.mean([r['keyakinan'] for r in rekap]) * 100:.1f}%" if rekap else "—",
+        )
 
-    kolom=st.columns(7)
-    unggahan={}
-    for i,k in enumerate(DAFTAR_KELAS):
+# ════════════ TAB 3 — UJI 7 EKSPRESI ════════════
+with tab_tujuh:
+    st.markdown("#### 🧪 Uji 7 Ekspresi — Apakah model mengenali semua ekspresi?")
+    st.markdown(
+        "Unggah **1 foto per ekspresi** yang Anda peragakan. Sistem memeriksa apakah prediksi = "
+        "label yang diharapkan — cara paling jujur menguji model (perhatikan kelas **takut/sedih** "
+        "yang memang sulit, recall uji 51% / 59%)."
+    )
+    st.caption("Tips: pose ekspresif, cahaya depan, jarak ±50 cm, 1 orang per foto, hindari masker/kacamata gelap.")
+
+    kolom = st.columns(7)
+    unggahan = {}
+    for i, k in enumerate(DAFTAR_KELAS):
         with kolom[i]:
-            info=INFO_KELAS.get(k, {"emoji":""})
-            st.markdown(f"**{info['emoji']} {k}**")
-            up=st.file_uploader(f"{k}", type=['jpg','jpeg','png'], key=f"up_{k}", label_visibility="collapsed")
-            unggahan[k]=up
+            info = INFO_KELAS.get(k, {"emoji": "🎭"})
+            st.markdown(f"### {info['emoji']} {k}")
+            up = st.file_uploader(f"Foto {k}", type=["jpg", "jpeg", "png"], key=f"up_{k}", label_visibility="collapsed")
+            unggahan[k] = up
             if up:
-                gm=Image.open(up).convert("RGB")
-                st.image(gm, use_container_width=True)
+                st.image(Image.open(up).convert("RGB"), width="stretch")
 
     if st.button("▶️ Jalankan Validasi 7 Ekspresi", type="primary"):
         if not any(unggahan.values()):
-            st.warning("Unggah minimal 1 foto dulu.")
+            st.warning("Unggah minimal 1 foto terlebih dahulu.")
         else:
-            hasil=[]
+            hasil = []
             for k in DAFTAR_KELAS:
-                up=unggahan[k]
+                up = unggahan[k]
                 if up is None:
-                    hasil.append({"diharapkan":k,"prediksi":"-","keyakinan":0,"benar":None,"detail":"tidak diunggah"})
+                    hasil.append({"diharapkan": k, "prediksi": "—", "keyakinan": None, "benar": None})
                     continue
-                gm=Image.open(up).convert("RGB")
-                bgr=cv2.cvtColor(np.array(gm), cv2.COLOR_RGB2BGR)
-                an,det=anotasi_frame(bgr)
+                gm = Image.open(up).convert("RGB")
+                bgr = cv2.cvtColor(np.array(gm), cv2.COLOR_RGB2BGR)
+                an, det = anotasi_frame(bgr)
                 if not det:
-                    hasil.append({"diharapkan":k,"prediksi":"tidak ada wajah","keyakinan":0,"benar":False,"detail":"wajah tidak terdeteksi","an":an})
+                    hasil.append({"diharapkan": k, "prediksi": "tidak ada wajah", "keyakinan": 0,
+                                  "benar": False, "an": an})
                 else:
-                    d=det[0]
-                    benar=(d['label']==k)
-                    hasil.append({"diharapkan":k,"prediksi":d['label'],"keyakinan":d['keyakinan'],"benar":benar,"prob":d['prob'],"an":an,"det":det})
+                    d = det[0]
+                    hasil.append({"diharapkan": k, "prediksi": d["label"], "keyakinan": d["keyakinan"],
+                                  "benar": d["label"] == k, "an": an, "prob": d["prob"]})
 
             st.divider()
-            st.subheader("Hasil Validasi")
-            jml_benar=sum(1 for r in hasil if r['benar']==True)
-            jml_uji=sum(1 for r in hasil if r['benar'] is not None)
-            akur=jml_benar/jml_uji*100 if jml_uji else 0
-            st.metric(f"Akurasi Manual (dari {jml_uji} foto)", f"{akur:.1f}%", f"{jml_benar}/{jml_uji} benar")
+            jml_benar = sum(1 for r in hasil if r["benar"] is True)
+            jml_uji = sum(1 for r in hasil if r["benar"] is not None)
+            akurasi = jml_benar / jml_uji * 100 if jml_uji else 0
+            component_metric("Akurasi Uji Manual", f"{akurasi:.1f}%", f"{jml_benar}/{jml_uji} benar")
 
-            df=pd.DataFrame([{
-                "Diharapkan":r['diharapkan'],
-                "Prediksi":r['prediksi'],
-                "Keyakinan":f"{r['keyakinan']:.2%}" if r['keyakinan'] else "-",
-                "Hasil":"✅ BENAR" if r['benar']==True else ("❌ SALAH" if r['benar']==False else "—"),
-                "Top-2 probabilitas": ", ".join([f"{model.names[i]}:{float(v):.2f}" for i,v in sorted(enumerate(r['prob']), key=lambda x: x[1], reverse=True)[:2]]) if 'prob' in r else r.get('detail','')
-            } for r in hasil])
+            df = pd.DataFrame([
+                {"Diharapkan": r["diharapkan"],
+                 "Prediksi": r["prediksi"],
+                 "Keyakinan": f"{r['keyakinan'] * 100:.1f}%" if r["keyakinan"] else "—",
+                 "Hasil": "✅ BENAR" if r["benar"] is True else ("❌ SALAH" if r["benar"] is False else "—")}
+                for r in hasil
+            ])
             st.table(df)
 
-            st.markdown("#### Rincian per Ekspresi")
-            kol2=st.columns(7)
-            for i,k in enumerate(DAFTAR_KELAS):
-                r=hasil[i]
-                with kol2[i]:
-                    if 'an' in r:
-                        st.image(cv2.cvtColor(r['an'],cv2.COLOR_BGR2RGB), caption=f"{k} -> {r['prediksi']} {r['keyakinan']:.0%}" if r['prediksi']!='-' else k, use_container_width=True)
-                    if r['benar']==False:
-                        kamus_prob={model.names[idx]:float(v) for idx,v in enumerate(r['prob'])}
-                        st.bar_chart(kamus_prob)
-                        if k in ["takut","sedih"] and r['prediksi'] in ["takut","sedih","netral"]:
-                            st.caption("⚠️ Memang kebingungan tinggi takut↔sedih↔netral (F1 takut 56%). Coba pose lebih ekspresif.")
+            st.markdown("##### Rincian per Ekspresi")
+            k2 = st.columns(7)
+            for i, r in enumerate(hasil):
+                with k2[i]:
+                    if r.get("an") is not None:
+                        st.image(cv2.cvtColor(r["an"], cv2.COLOR_BGR2RGB),
+                                 caption=f"{r['diharapkan']} → {r['prediksi']}", width="stretch")
+                    if r["benar"] is False and r.get("prob") is not None:
+                        kamus = {model.names[i_]: float(v) for i_, v in enumerate(r["prob"])}
+                        st.bar_chart(kamus, height=140, color="#f59e0b")
+                        if r["diharapkan"] in ("takut", "sedih") and r["prediksi"] in ("takut", "sedih", "netral"):
+                            st.caption("⚠️ Kebingungan alami takut↔sedih↔netral (lihat info model).")
 
-            st.info("Catatan: Model V2 akurasi uji 71%, kelas **senang 88% & terkejut 82%** hampir selalu benar, tapi **takut 52% & sedih 59%** sering salah. Jika uji manual juga gagal di 2 kelas itu, itu wajar — bukan bug, memang data FER sulit. Coba ganti pose lebih jelas atau latih ulang dengan data tambahan.")
-            st.bar_chart({r['diharapkan']: 1 if r['benar'] else 0 for r in hasil if r['benar'] is not None})
+            st.info(
+                "Model final (V3 + Fine-Tune) top-1 **69,6%** pada uji asli FER2013. "
+                "Kelas **senang 87% & terkejut 83%** hampir selalu benar; **takut 51% & sedih 59%** "
+                "paling sering tertukar — wajar untuk data FER grayscale, bukan bug. "
+                "Coba pose lebih ekspresif atau bandingkan dengan mode Analisis Gambar."
+            )
 
-    st.divider()
-    with st.expander("Atau: Validasi otomatis dari folder data uji (tanpa unggah manual)"):
-        st.write("Ambil 2 sampel acak per kelas dari `dataset_fer2013/val` untuk lihat apakah model sudah benar (cek cepat).")
-        if st.button("🎲 Ambil Sampel Acak Uji"):
-            basis=r"C:\Users\Admin\Documents\Kuliah\herfandi-ml\hasil_ekspresi_yolov8m\dataset_fer2013\val"
-            if not os.path.exists(basis):
-                basis="dataset_fer2013/val"
-            if not os.path.exists(basis):
-                st.error(f"Folder uji tidak ditemukan: {basis}")
-            else:
-                import random, glob
-                sampel=[]
-                for k in DAFTAR_KELAS:
-                    folder=os.path.join(basis,k)
-                    if not os.path.exists(folder): continue
-                    daftar=glob.glob(os.path.join(folder,"*.*"))
-                    if not daftar: continue
-                    pilih=random.sample(daftar, min(2,len(daftar)))
-                    for pf in pilih:
-                        bgr=cv2.imread(pf)
-                        if bgr is None: continue
-                        label,keyakinan,_=prediksi_potongan(bgr)
-                        sampel.append((k, os.path.basename(pf), label, keyakinan, pf, label==k))
-                df2=pd.DataFrame([{"Folder (asli)":s[0],"Berkas":s[1],"Prediksi":s[2],"Keyakinan":f"{s[3]:.2%}","Benar?": "✅" if s[5] else "❌"} for s in sampel])
-                st.table(df2)
-                ak2=sum(1 for s in sampel if s[5])/len(sampel)*100 if sampel else 0
-                st.metric("Akurasi sampel acak", f"{ak2:.1f}%", f"{sum(1 for s in sampel if s[5])}/{len(sampel)}")
-                kol3=st.columns(3)
-                for i,s in enumerate(sampel):
-                    with kol3[i%3]:
-                        bgr=cv2.imread(s[4])
-                        if bgr is not None:
-                            st.image(cv2.cvtColor(bgr,cv2.COLOR_BGR2RGB), caption=f"{s[0]} -> {s[2]} {s[3]:.0%} {'✅' if s[5] else '❌'}", use_container_width=True)
-
-# ===== MODE 4: Video =====
-else:
-    st.header("🎞️ Unggah Video")
-    upv=st.file_uploader("Pilih video mp4/avi/mov", type=['mp4','avi','mov','mkv'])
-    cuplik=st.slider("Ambil 1 frame per N detik", 1, 5, 1)
+# ════════════ TAB 4 — VIDEO ════════════
+with tab_video:
+    st.markdown("#### 🎞️ Analisis Video (sampling per detik)")
+    upv = st.file_uploader("Pilih video (mp4/avi/mov/mkv)", type=["mp4", "avi", "mov", "mkv"])
+    cuplik = st.slider("Ambil 1 frame per N detik", 1, 5, 1)
     if upv:
-        tfile=tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        tfile.write(upv.read()); tfile.close()
-        cap=cv2.VideoCapture(tfile.name)
-        fps=cap.get(cv2.CAP_PROP_FPS) or 30
-        total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        st.write(f"FPS {fps:.1f} total {total} frame (~{total/fps:.1f} detik)")
-        if st.button("▶️ Analisis"):
-            prog=st.progress(0)
-            idx=0; hasil_detik=[]
-            cap.set(cv2.CAP_PROP_POS_FRAMES,0)
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(upv.read())
+        tfile.close()
+        cap = cv2.VideoCapture(tfile.name)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        st.caption(f"FPS {fps:.1f} · total {total} frame (±{total / fps:.1f} detik)")
+        if st.button("▶️ Analisis Video", type="primary"):
+            prog = st.progress(0, text="Memproses frame…")
+            idx, hasil_detik = 0, []
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             while True:
-                ret,frame=cap.read()
-                if not ret: break
-                langkah=max(1,int(fps*cuplik))
-                if idx%langkah==0:
-                    an,det=anotasi_frame(frame)
-                    lab=det[0]['label'] if det else 'tidak ada wajah'
-                    key=det[0]['keyakinan'] if det else 0
-                    hasil_detik.append({"detik":idx/fps,"label":lab,"keyakinan":key,"an":an})
-                    with st.expander(f"Detik {idx/fps:.1f} — {lab} {key:.0%}" if det else f"Detik {idx/fps:.1f} — tidak ada wajah"):
-                        st.image(cv2.cvtColor(an,cv2.COLOR_BGR2RGB), use_container_width=True)
-                idx+=1
-                prog.progress(min(idx/total,1.0) if total else 0)
-            cap.release(); os.unlink(tfile.name)
-            if hasil_detik:
-                daftar=[r['label'] for r in hasil_detik if r['label']!='tidak ada wajah']
-                if daftar:
-                    hit=Counter(daftar); dom=hit.most_common(1)[0]
-                    st.success(f"Dominan: {dom[0]} ({dom[1]}/{len(daftar)} = {dom[1]/len(daftar):.0%})")
-                    st.bar_chart({k:hit.get(k,0) for k in DAFTAR_KELAS})
-                    st.table(pd.DataFrame([{"Detik":f"{r['detik']:.1f} dtk","Label":r['label'],"Keyakinan":f"{r['keyakinan']:.2%}"} for r in hasil_detik]))
-        else:
-            cap.release(); os.unlink(tfile.name)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                langkah = max(1, int(fps * cuplik))
+                if idx % langkah == 0:
+                    an, det = anotasi_frame(frame)
+                    lab = det[0]["label"] if det else "tidak ada wajah"
+                    key = det[0]["keyakinan"] if det else 0
+                    hasil_detik.append({"detik": idx / fps, "label": lab, "keyakinan": key, "an": an})
+                idx += 1
+                prog.progress(min(idx / total, 1.0) if total else 0,
+                              text=f"Frame {idx}/{total}")
+            cap.release()
+            os.unlink(tfile.name)
+            prog.empty()
 
-st.markdown("---")
-st.caption("V2 YOLOv8m 224px • Top1 71,22% • Takut & Sedih memang lemah (56-59% F1). Uji 7 pose ekspresif untuk validasi paling jujur.")
+            if hasil_detik:
+                daftar = [r["label"] for r in hasil_detik if r["label"] != "tidak ada wajah"]
+                m_a, m_b = st.columns(2)
+                if daftar:
+                    hit = Counter(daftar)
+                    dom = hit.most_common(1)[0]
+                    m_a.metric("Ekspresi Dominan", f"{dom[0]}", f"{dom[1]}/{len(daftar)} frame")
+                    m_b.metric("Frame Teranalisis", len(hasil_detik))
+                    st.bar_chart({k: hit.get(k, 0) for k in DAFTAR_KELAS})
+                else:
+                    m_a.metric("Ekspresi Dominan", "—")
+                    m_b.metric("Frame Teranalisis", len(hasil_detik))
+                    st.warning("Tidak ada wajah terdeteksi di seluruh video.")
+
+                st.markdown("##### Garis Waktu")
+                st.dataframe(
+                    pd.DataFrame([
+                        {"Detik": f"{r['detik']:.1f}", "Ekspresi": r["label"],
+                         "Keyakinan": f"{r['keyakinan'] * 100:.1f}%"} for r in hasil_detik
+                    ]),
+                    width="stretch",
+                    hide_index=True,
+                )
+                with st.expander("🖼️ Lihat frame hasil"):
+                    for r in hasil_detik:
+                        st.image(cv2.cvtColor(r["an"], cv2.COLOR_BGR2RGB),
+                                 caption=f"Detik {r['detik']:.1f} — {r['label']} {r['keyakinan']:.0%}",
+                                 width="stretch")
+        else:
+            cap.release()
+            os.unlink(tfile.name)
+
+# ════════════ TAB 5 — INFO MODEL ════════════
+with tab_info:
+    st.markdown("#### 📊 Info Model & Bukti Kinerja")
+
+    c1, c2 = st.columns([3, 2], gap="large")
+    with c1:
+        st.markdown("**Model yang sedang dipakai:**")
+        st.code(str(MODEL_PATH), language=None)
+        df_info = pd.DataFrame([
+            {"Properti": "Arsitektur", "Nilai": "YOLOv8m-cls (42 layer · 15.771.623 parameter · 41,6 GFLOPs)"},
+            {"Properti": "Tahap 1 — Baseline", "Nilai": "150 epoch, freeze=9, lr0=0.0005 → Top-1 62,93% (best E60)"},
+            {"Properti": "Tahap 2 — Fine-Tune", "Nilai": "60 epoch, freeze=4, lr0=0.0002 → Top-1 69,59% (best E47)"},
+            {"Properti": "Akurasi Uji (7.178 asli)", "Nilai": f"Top-1 {metrik[0]:.2f}% · Top-5 {metrik[1]:.2f}%" if metrik[0] else "—"},
+            {"Properti": "Reproduksibilitas", "Nilai": "seed 42 · deterministic=True · amp=False · cos_lr"},
+            {"Properti": "Dataset", "Nilai": "FER2013 — 47.000 train (CLAHE+224+balance) / 7.178 val asli"},
+        ])
+        st.table(df_info)
+
+        st.markdown("**Rekap Validasi Final — recall per kelas:**")
+        df_kelas = pd.DataFrame([
+            {"Ekspresi": f"{v['emoji']} {k}", "Recall Uji": f"{v['recall']:.1f}%",
+             "Sampel Uji": v["support"], "Catatan": v["deskripsi"]}
+            for k, v in sorted(INFO_KELAS.items())
+        ])
+        st.table(df_kelas)
+    with c2:
+        cm_path = REPO_ROOT / "docs" / "confusion_matrix_v3.png"
+        if cm_path.exists():
+            st.markdown("**Confusion matrix — validasi final (computed by notebook):**")
+            st.image(Image.open(cm_path), width="stretch")
+        else:
+            st.info("`docs/confusion_matrix_v3.png` belum ada — jalankan sel Validasi di notebook.")
+
+    kurva_path = REPO_ROOT / "docs" / "results_v3.png"
+    if kurva_path.exists():
+        st.markdown("**Kurva pelatihan & validasi (Tahap 2 — Fine-Tune):**")
+        st.image(Image.open(kurva_path), width="stretch")
+
+    st.markdown(
+        "---\n"
+        "**Catatan jujur:** kelas **takut (51%)** dan **sedih (59%)** adalah yang paling sulit untuk data "
+        "FER2013 grayscale — saling tertukar dengan netral. Semua angka diambil dari validasi otomatis "
+        "7.178 gambar uji asli (bukan data latih), tercatat permanen di notebook "
+        "`nb-klasifikasi-ekspresi-wajah.ipynb` (log eksekusi asli tiap sel) dan `runs/*/results.csv`."
+    )
+
+st.markdown(
+    "<div style='margin-top:20px;color:#64748b;font-size:12px;text-align:center'>"
+    "YOLOv8m-cls · FER2013 · seed 42 (deterministik) · Top-1 69,59% / Top-5 98,98% — validasi otomatis 7.178 gambar uji asli"
+    "</div>",
+    unsafe_allow_html=True,
+)
